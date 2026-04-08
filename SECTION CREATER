@@ -1,0 +1,95 @@
+# -*- coding: utf-8 -*-
+
+from Autodesk.Revit.DB import *
+from pyrevit import revit, script
+
+uidoc = revit.uidoc
+doc = revit.doc
+
+# ----------------------------
+# Pick Points
+# ----------------------------
+try:
+    p1 = uidoc.Selection.PickPoint("Pick Origin Point")
+    p2 = uidoc.Selection.PickPoint("Pick Direction Point")
+except:
+    script.exit()
+
+# ----------------------------
+# Direction Logic (X / Y snap)
+# ----------------------------
+dx = p2.X - p1.X
+dy = p2.Y - p1.Y
+
+if abs(dx) > abs(dy):
+    direction = "X"
+else:
+    direction = "Y"
+
+# ----------------------------
+# Get Section View Type
+# ----------------------------
+section_type = None
+for v in FilteredElementCollector(doc).OfClass(ViewFamilyType):
+    if v.ViewFamily == ViewFamily.Section:
+        section_type = v
+        break
+
+if not section_type:
+    script.exit()
+
+# ----------------------------
+# Create Transform
+# ----------------------------
+transform = Transform.Identity
+transform.Origin = p1
+
+up = XYZ.BasisZ
+
+if direction == "X":
+    view_dir = XYZ(0, 1, 0)
+else:
+    view_dir = XYZ(1, 0, 0)
+
+view_dir = view_dir.Normalize()
+
+right = up.CrossProduct(view_dir).Normalize()
+up = view_dir.CrossProduct(right).Normalize()
+
+dir_vec = (p2 - p1).Normalize()
+if right.DotProduct(dir_vec) < 0:
+    right = right.Negate()
+
+transform.BasisX = right
+transform.BasisY = up
+transform.BasisZ = view_dir
+
+# ----------------------------
+# Section Box (CENTERED at P1)
+# ----------------------------
+width = 10
+height = 10
+depth = 5
+
+box = BoundingBoxXYZ()
+box.Transform = transform
+box.Min = XYZ(0, 0, 0)
+box.Max = XYZ(width/2, depth/2, height/2)
+
+# ----------------------------
+# Create Section
+# ----------------------------
+t = Transaction(doc, "Create Auto Section")
+t.Start()
+
+section = ViewSection.CreateSection(doc, section_type.Id, box)
+
+# ✅ Set Detail Level = Fine
+section.DetailLevel = ViewDetailLevel.Fine
+
+t.Commit()
+
+# ----------------------------
+# Open Section View
+# ----------------------------
+uidoc.RequestViewChange(section)
