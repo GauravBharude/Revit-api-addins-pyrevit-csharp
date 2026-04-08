@@ -1,0 +1,94 @@
+# -*- coding: utf-8 -*-
+from Autodesk.Revit.DB import *
+from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
+from Autodesk.Revit.DB.Plumbing import Pipe
+from pyrevit import revit, forms
+import traceback
+
+uidoc = revit.uidoc
+doc = revit.doc
+
+
+# -----------------------------
+# Selection Filter for Pipes
+# -----------------------------
+class PipeSelectionFilter(ISelectionFilter):
+    def AllowElement(self, element):
+        return isinstance(element, Pipe)
+
+    def AllowReference(self, reference, position):
+        return True
+
+
+def get_pipe(prompt):
+    try:
+        ref = uidoc.Selection.PickObject(
+            ObjectType.Element,
+            PipeSelectionFilter(),
+            prompt
+        )
+        return doc.GetElement(ref.ElementId)
+    except:
+        return None
+
+
+def get_middle_z(pipe):
+    loc = pipe.Location
+    if not isinstance(loc, LocationCurve):
+        return None
+    curve = loc.Curve
+    mid = curve.Evaluate(0.5, True)
+    return mid.Z
+
+
+# -----------------------------
+# Main Execution
+# -----------------------------
+try:
+    # Pick first pipe
+    pipe1 = get_pipe("Select FIRST pipe (Reference Middle Elevation)")
+    if not pipe1:
+        forms.alert("Operation cancelled.", exitscript=True)
+
+    # Pick second pipe
+    pipe2 = get_pipe("Select SECOND pipe (To Match Elevation)")
+    if not pipe2:
+        forms.alert("Operation cancelled.", exitscript=True)
+
+    # Get midpoint elevations
+    z1 = get_middle_z(pipe1)
+    z2 = get_middle_z(pipe2)
+
+    if z1 is None or z2 is None:
+        forms.alert("Could not calculate pipe geometry.", exitscript=True)
+
+    z_diff = z1 - z2
+
+    if abs(z_diff) < 0.0001:
+        forms.alert("Both pipes already have the same middle elevation.")
+        script.exit()
+
+    t = Transaction(doc, "Match Pipe Middle Elevation")
+    t.Start()
+
+    # Unpin if needed
+    was_pinned = pipe2.Pinned
+    if was_pinned:
+        pipe2.Pinned = False
+
+    ElementTransformUtils.MoveElement(
+        doc,
+        pipe2.Id,
+        XYZ(0, 0, z_diff)
+    )
+
+    # Restore pin state
+    if was_pinned:
+        pipe2.Pinned = True
+
+    t.Commit()
+
+    forms.alert("Middle elevation matched successfully!")
+
+except Exception as e:
+    forms.alert("Error occurred:\n\n{}".format(str(e)))
