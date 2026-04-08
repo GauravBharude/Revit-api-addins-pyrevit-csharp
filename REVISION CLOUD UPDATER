@@ -1,0 +1,47 @@
+# -*- coding: utf-8 -*-
+
+from Autodesk.Revit.DB import *
+from pyrevit import revit, forms
+
+doc = revit.doc
+
+# Collect all revisions in project
+revisions = FilteredElementCollector(doc)\
+            .OfCategory(BuiltInCategory.OST_Revisions)\
+            .WhereElementIsNotElementType()\
+            .ToElements()
+
+# Create dictionary for selection
+rev_dict = {r.Name: r for r in revisions}
+
+# Ask user which revision to apply
+selected_rev_name = forms.SelectFromList.show(
+    sorted(rev_dict.keys()),
+    title='Select Revision to Apply to All Clouds',
+    multiselect=False
+)
+
+if not selected_rev_name:
+    forms.alert("No revision selected.")
+    script.exit()
+
+selected_revision = rev_dict[selected_rev_name]
+
+# Collect all revision clouds
+clouds = FilteredElementCollector(doc)\
+         .OfCategory(BuiltInCategory.OST_RevisionClouds)\
+         .WhereElementIsNotElementType()\
+         .ToElements()
+
+# Apply revision
+t = Transaction(doc, "Update All Revision Clouds")
+t.Start()
+
+for cloud in clouds:
+    param = cloud.get_Parameter(BuiltInParameter.REVISION_CLOUD_REVISION)
+    if param:
+        param.Set(selected_revision.Id)
+
+t.Commit()
+
+forms.alert("Revision updated for {} revision clouds.".format(len(clouds)))
