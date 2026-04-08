@@ -1,0 +1,212 @@
+# -*- coding: utf-8 -*-
+
+import math
+from Autodesk.Revit.DB import *
+from Autodesk.Revit.DB.Plumbing import Pipe
+from pyrevit import revit, forms
+
+doc = revit.doc
+uidoc = revit.uidoc
+
+MIN_LEN    = 0.1 / 12.0   # 1/10 inch in feet
+MM_TO_FEET = 1.0 / 304.8  # mm to feet conversion
+
+# ------------------ Helpers ------------------
+
+def get_open_connectors(pipe):
+    return [c for c in pipe.ConnectorManager.Connectors if not c.IsConnected]
+
+def closest_connector(connectors, point):
+    return min(connectors, key=lambda c: c.Origin.DistanceTo(point))
+
+def place_elbow(ca, cb):
+    try:
+        doc.Create.NewElbowFitting(ca, cb)
+        return True
+    except Exception as e:
+        forms.alert("Elbow failed: " + str(e))
+        return False
+
+def get_pipe_length_mm(pipe):
+    return pipe.Location.Curve.Length * 304.8  # feet → mm
+
+def get_backward_offset_feet(pipe_length_mm):
+    """
+    < 200mm  → half the pipe length
+    >= 300mm → 200mm
+    200-300mm → half the pipe length
+    """
+    if pipe_length_mm >= 300:
+        return 200.0 * MM_TO_FEET
+    else:
+        return (pipe_length_mm / 2.0) * MM_TO_FEET
+
+def move_pipe_open_end_backwards(pipe, open_connector, offset_feet):
+    """Shrinks pipe from its open end by offset_feet. Returns new open end point."""
+    curve      = pipe.Location.Curve
+    pt_start   = curve.GetEndPoint(0)
+    pt_end     = curve.GetEndPoint(1)
+
+    if open_connector.Origin.IsAlmostEqualTo(pt_end):
+        direction = (pt_end - pt_start).Normalize()
+        new_pt    = pt_end - direction.Multiply(offset_feet)
+        pipe.Location.Curve = Line.CreateBound(pt_start, new_pt)
+        return new_pt
+    else:
+        direction = (pt_start - pt_end).Normalize()
+        new_pt    = pt_start - direction.Multiply(offset_feet)
+        pipe.Location.Curve = Line.CreateBound(new_pt, pt_end)
+        return new_pt
+
+def move_vertical_pipe_to_xy(pipe, target_x, target_y):
+    """
+    Moves a vertical pipe back to target XY (original XY of p2/p1),
+    keeping its Z coordinates intact.
+    """
+    curve   = pipe.Location.Curve
+    pt0     = curve.GetEndPoint(0)
+    pt1     = curve.GetEndPoint(1)
+    new_pt0 = XYZ(target_x, target_y, pt0.Z)
+    new_pt1 = XYZ(target_x, target_y, pt1.Z)
+    pipe.Location.Curve = Line.CreateBound(new_pt0, new_pt1)
+
+# ------------------ Selection ------------------
+
+sel_ids = list(uidoc.Selection.GetElementIds())
+if len(sel_ids) != 2:
+    forms.alert("Select EXACTLY two pipes.", exitscript=True)
+
+pipe1 = doc.GetElement(sel_ids[0])
+pipe2 = doc.GetElement(sel_ids[1])
+
+if not isinstance(pipe1, Pipe) or not isinstance(pipe2, Pipe):
+    forms.alert("Selected elements must be pipes.", exitscript=True)
+
+open1 = get_open_connectors(pipe1)
+open2 = get_open_connectors(pipe2)
+
+if not open1 or not open2:
+    forms.alert("Both pipes must have open connectors.", exitscript=True)
+
+c1 = closest_connector(open1, pipe2.Location.Curve.GetEndPoint(0))
+c2 = closest_connector(open2, c1.Origin)
+
+p1         = c1.Origin
+p2         = c2.Origin
+original_x = p1.X  # store original XY before any movement
+original_y = p1.Y
+
+pipe_type_id   = pipe1.GetTypeId()
+system_type_id = pipe1.MEPSystem.GetTypeId()
+level_id       = pipe1.ReferenceLevel.Id
+
+diam1    = pipe1.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM).AsDouble()
+diam2    = pipe2.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM).AsDouble()
+max_diam = max(diam1, diam2)
+
+# Detect pure vertical case
+xy_same = (abs(p1.X - p2.X) < 1e-4) and (abs(p1.Y - p2.Y) < 1e-4)
+z_diff  = abs(p1.Z - p2.Z) > MIN_LEN
+
+# ------------------ Transaction ------------------
+
+t = Transaction(doc, "Connect Pipes via Vertical + Horizontal Route")
+t.Start()
+
+try:
+    # ── SPECIAL CASE: XY same, Z different ──────────────────────────────────
+    if xy_same and z_diff:
+
+        # Step A: Move Pipe1 open end backwards
+        pipe1_len_mm = get_pipe_length_mm(pipe1)
+        offset_feet  = get_backward_offset_feet(pipe1_len_mm)
+        new_p1       = move_pipe_open_end_backwards(pipe1, c1, offset_feet)
+        doc.Regenerate()
+
+        # Re-fetch c1 from new position
+        open1_new = get_open_connectors(pipe1)
+        if not open1_new:
+            raise Exception("No open connectors on Pipe1 after moving backwards.")
+        c1 = closest_connector(open1_new, p2)
+        p1 = c1.Origin
+
+        # Corner is now offset in XY from original — needed so horiz segment exists
+        corner = XYZ(p1.X, p1.Y, p2.Z)
+
+        if p1.DistanceTo(corner) < MIN_LEN:
+            raise Exception("Not enough vertical distance after offset.")
+        if corner.DistanceTo(p2) < MIN_LEN:
+            raise Exception("Not enough horizontal distance after offset.")
+
+        # Step B: Create vertical pipe at offset XY (p1 → corner)
+        vert_pipe = Pipe.Create(doc, system_type_id, pipe_type_id, level_id, p1, corner)
+        pv = vert_pipe.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM)
+        if pv and not pv.IsReadOnly:
+            pv.Set(max_diam)
+
+        # Step C: Create horizontal pipe (corner → p2)
+        horiz_pipe = Pipe.Create(doc, system_type_id, pipe_type_id, level_id, corner, p2)
+        ph = horiz_pipe.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM)
+        if ph and not ph.IsReadOnly:
+            ph.Set(max_diam)
+
+        doc.Regenerate()
+
+        # Step D: Place all three elbows
+        c_vert_p1 = closest_connector(get_open_connectors(vert_pipe), p1)
+        place_elbow(c1, c_vert_p1)
+        doc.Regenerate()
+
+        c_vert_corner  = closest_connector(get_open_connectors(vert_pipe),  corner)
+        c_horiz_corner = closest_connector(get_open_connectors(horiz_pipe), corner)
+        place_elbow(c_vert_corner, c_horiz_corner)
+        doc.Regenerate()
+
+        c_horiz_p2 = closest_connector(get_open_connectors(horiz_pipe), p2)
+        place_elbow(c2, c_horiz_p2)
+        doc.Regenerate()
+
+        # Step E: Move vertical pipe back to original XY ──────────────────────
+        # Fittings are already placed and connected — now slide vert_pipe
+        # back to original_x, original_y keeping Z intact.
+        move_vertical_pipe_to_xy(vert_pipe, original_x, original_y)
+        doc.Regenerate()
+
+    # ── NORMAL CASE ──────────────────────────────────────────────────────────
+    else:
+        corner = XYZ(p1.X, p1.Y, p2.Z)
+
+        if p1.DistanceTo(corner) < MIN_LEN:
+            raise Exception("Pipes are at the same elevation.")
+        if corner.DistanceTo(p2) < MIN_LEN:
+            raise Exception("Pipes share the same XY position.")
+
+        vert_pipe = Pipe.Create(doc, system_type_id, pipe_type_id, level_id, p1, corner)
+        pv = vert_pipe.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM)
+        if pv and not pv.IsReadOnly:
+            pv.Set(max_diam)
+
+        horiz_pipe = Pipe.Create(doc, system_type_id, pipe_type_id, level_id, corner, p2)
+        ph = horiz_pipe.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM)
+        if ph and not ph.IsReadOnly:
+            ph.Set(max_diam)
+
+        doc.Regenerate()
+
+        c_vert_p1 = closest_connector(get_open_connectors(vert_pipe), p1)
+        place_elbow(c1, c_vert_p1)
+        doc.Regenerate()
+
+        c_vert_corner  = closest_connector(get_open_connectors(vert_pipe),  corner)
+        c_horiz_corner = closest_connector(get_open_connectors(horiz_pipe), corner)
+        place_elbow(c_vert_corner, c_horiz_corner)
+        doc.Regenerate()
+
+        c_horiz_p2 = closest_connector(get_open_connectors(horiz_pipe), p2)
+        place_elbow(c2, c_horiz_p2)
+
+    t.Commit()
+
+except Exception as e:
+    t.RollBack()
+    forms.alert("Script rolled back.\n\nReason: " + str(e), exitscript=True)
