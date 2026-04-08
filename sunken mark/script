@@ -1,0 +1,236 @@
+# -*- coding: utf-8 -*-
+
+from Autodesk.Revit.DB import *
+from Autodesk.Revit.DB.Plumbing import Pipe
+from Autodesk.Revit.UI.Selection import ObjectType
+from pyrevit import revit, forms, script
+from System.Collections.Generic import List
+
+doc = revit.doc
+uidoc = revit.uidoc
+view = doc.ActiveView
+
+CLEARANCE = 20 / 304.8  # 20 mm each side
+
+sunken_needed = False
+
+# -----------------------------
+# FILLED REGION TYPE
+# -----------------------------
+fr_type = FilteredElementCollector(doc)\
+    .OfClass(FilledRegionType)\
+    .FirstElement()
+
+if not fr_type:
+    forms.alert("No Filled Region Type found")
+    script.exit()
+
+# -----------------------------
+# ENSURE SKETCH PLANE
+# -----------------------------
+if not view.SketchPlane:
+    t0 = Transaction(doc, "Set Sketch Plane")
+    t0.Start()
+    plane = Plane.CreateByNormalAndOrigin(view.ViewDirection, view.Origin)
+    view.SketchPlane = SketchPlane.Create(doc, plane)
+    t0.Commit()
+
+z_val = view.SketchPlane.GetPlane().Origin.Z
+
+# -----------------------------
+# SELECT PIPES
+# -----------------------------
+refs = uidoc.Selection.PickObjects(ObjectType.Element, "Select Pipes")
+
+pipes = [doc.GetElement(r) for r in refs if isinstance(doc.GetElement(r), Pipe)]
+
+if not pipes:
+    forms.alert("No pipes selected")
+    script.exit()
+
+# --------------------------------------------------
+# GET UNIQUE ROOM NAMES FROM LINKED MODELS
+# --------------------------------------------------
+def get_all_room_names():
+
+    room_names = set()
+
+    links = FilteredElementCollector(doc).OfClass(RevitLinkInstance)
+
+    for link in links:
+
+        link_doc = link.GetLinkDocument()
+        if not link_doc:
+            continue
+
+        rooms = FilteredElementCollector(link_doc)\
+            .OfCategory(BuiltInCategory.OST_Rooms)\
+            .WhereElementIsNotElementType()
+
+        for room in rooms:
+            try:
+                name = room.LookupParameter("Name").AsString()
+                if name:
+                    room_names.add(name)
+            except:
+                pass
+
+    return sorted(list(room_names))
+
+
+# --------------------------------------------------
+# DEFAULT ROOM KEYWORDS
+# --------------------------------------------------
+default_keywords = [
+    "bath",
+    "toilet",
+    "powder",
+    "wc",
+    "wash"
+]
+
+# --------------------------------------------------
+# ROOM SELECTION UI
+# --------------------------------------------------
+all_rooms = get_all_room_names()
+
+room_options = []
+
+for r in all_rooms:
+
+    checked = False
+
+    for key in default_keywords:
+        if key in r.lower():
+            checked = True
+            break
+
+    room_options.append(
+        forms.TemplateListItem(r, checked=checked)
+    )
+
+selected = forms.SelectFromList.show(
+    room_options,
+    title="Select Rooms Where Pipes Are Allowed",
+    multiselect=True
+)
+
+if not selected:
+    forms.alert("No rooms selected")
+    script.exit()
+
+valid_rooms = [r.lower() for r in selected]
+
+# --------------------------------------------------
+# ROOM CHECK FUNCTION
+# --------------------------------------------------
+def get_room(point):
+
+    links = FilteredElementCollector(doc).OfClass(RevitLinkInstance)
+
+    for link in links:
+
+        link_doc = link.GetLinkDocument()
+        if not link_doc:
+            continue
+
+        link_point = link.GetTotalTransform().Inverse.OfPoint(point)
+
+        rooms = FilteredElementCollector(link_doc)\
+            .OfCategory(BuiltInCategory.OST_Rooms)\
+            .WhereElementIsNotElementType()
+
+        for room in rooms:
+            try:
+                if room.IsPointInRoom(link_point):
+                    return room
+            except:
+                pass
+
+    return None
+
+
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
+t = Transaction(doc, "Pipe Hatch")
+t.Start()
+
+for pipe in pipes:
+
+    try:
+
+        loc = pipe.Location
+        if not isinstance(loc, LocationCurve):
+            continue
+
+        curve = loc.Curve
+        mid = curve.Evaluate(0.5, True)
+
+        room = get_room(mid)
+
+        skip = False
+
+        if room:
+            try:
+                room_name = room.LookupParameter("Name").AsString().lower()
+                if room_name in valid_rooms:
+                    skip = True
+            except:
+                pass
+
+        if skip:
+            continue
+
+        p_start = curve.GetEndPoint(0)
+        p_end   = curve.GetEndPoint(1)
+
+        p1 = XYZ(p_start.X, p_start.Y, z_val)
+        p2 = XYZ(p_end.X, p_end.Y, z_val)
+
+        direction = (p2 - p1)
+
+        if direction.GetLength() == 0:
+            continue
+
+        direction = direction.Normalize()
+
+        perp = XYZ(-direction.Y, direction.X, 0)
+
+        dia = pipe.get_Parameter(
+            BuiltInParameter.RBS_PIPE_DIAMETER_PARAM
+        ).AsDouble()
+
+        offset = perp * ((dia / 2) + CLEARANCE)
+
+        A = p1 + offset
+        B = p2 + offset
+        C = p2 - offset
+        D = p1 - offset
+
+        loop = CurveLoop()
+
+        loop.Append(Line.CreateBound(A, B))
+        loop.Append(Line.CreateBound(B, C))
+        loop.Append(Line.CreateBound(C, D))
+        loop.Append(Line.CreateBound(D, A))
+
+        loops = List[CurveLoop]()
+        loops.Add(loop)
+
+        FilledRegion.Create(doc, fr_type.Id, view.Id, loops)
+
+        sunken_needed = True
+
+    except:
+        pass
+
+t.Commit()
+
+# -----------------------------
+# FINAL MESSAGE
+# -----------------------------
+if sunken_needed:
+    forms.alert("SUNKEN NEEDED")
+else:
+    forms.alert("PIPES DON'T REQUIRE SUNKEN")
