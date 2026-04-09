@@ -1,0 +1,97 @@
+using Autodesk.Revit.DB;
+using Autodesk.Revit.UI;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+public class CheckFixtureAboveStructure : IExternalCommand
+{
+    public Result Execute(ExternalCommandData commandData, ref string message, ElementSet elements)
+    {
+        Document doc = commandData.Application.ActiveUIDocument.Document;
+
+        // Get all Revit Links
+        var links = new FilteredElementCollector(doc)
+            .OfClass(typeof(RevitLinkInstance))
+            .Cast<RevitLinkInstance>()
+            .ToList();
+
+        // Identify AR and ST links (adjust names accordingly)
+        RevitLinkInstance arLink = links.FirstOrDefault(l => l.Name.Contains("AR"));
+        RevitLinkInstance stLink = links.FirstOrDefault(l => l.Name.Contains("ST"));
+
+        if (arLink == null || stLink == null)
+        {
+            TaskDialog.Show("Error", "AR or ST link not found");
+            return Result.Failed;
+        }
+
+        Document arDoc = arLink.GetLinkDocument();
+        Document stDoc = stLink.GetLinkDocument();
+
+        // -------------------------
+        // Get Plumbing Fixtures
+        // -------------------------
+        var fixtures = new FilteredElementCollector(arDoc)
+            .OfCategory(BuiltInCategory.OST_PlumbingFixtures)
+            .WhereElementIsNotElementType()
+            .ToElements();
+
+        // -------------------------
+        // Get Beams + Columns
+        // -------------------------
+        var beams = new FilteredElementCollector(stDoc)
+            .OfCategory(BuiltInCategory.OST_StructuralFraming)
+            .WhereElementIsNotElementType()
+            .ToElements();
+
+        var columns = new FilteredElementCollector(stDoc)
+            .OfCategory(BuiltInCategory.OST_StructuralColumns)
+            .WhereElementIsNotElementType()
+            .ToElements();
+
+        List<ElementId> clashIds = new List<ElementId>();
+
+        Transform arTransform = arLink.GetTransform();
+        Transform stTransform = stLink.GetTransform();
+
+        // -------------------------
+        // MAIN LOGIC
+        // -------------------------
+        foreach (var fixture in fixtures)
+        {
+            LocationPoint loc = fixture.Location as LocationPoint;
+            if (loc == null) continue;
+
+            XYZ point = arTransform.OfPoint(loc.Point); // convert to host coords
+
+            foreach (var beam in beams.Concat(columns))
+            {
+                BoundingBoxXYZ bb = beam.get_BoundingBox(null);
+                if (bb == null) continue;
+
+                XYZ min = stTransform.OfPoint(bb.Min);
+                XYZ max = stTransform.OfPoint(bb.Max);
+
+                bool isInsideXY =
+                    point.X >= min.X && point.X <= max.X &&
+                    point.Y >= min.Y && point.Y <= max.Y;
+
+                bool isAbove = point.Z > max.Z;
+
+                if (isInsideXY && isAbove)
+                {
+                    clashIds.Add(fixture.Id);
+                    break;
+                }
+            }
+        }
+
+        // -------------------------
+        // RESULT
+        // -------------------------
+        TaskDialog.Show("Result", $"Fixtures above structure: {clashIds.Count}");
+
+        return Result.Succeeded;
+    }
+}
